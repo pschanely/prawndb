@@ -1,0 +1,20 @@
+prawndb = require('../src/prawndb.coffee')
+require('coffee-trace')
+fs = require('fs')
+
+describe 'prawndb', ->
+  it 'can make new db files', (done)->
+    file = 'testdata.prawn'
+    shrimp = new prawndb.ShrimpDb(file)
+    shrimp.opendb()
+    shrimp.view().get().then((val) ->
+      val['x'] = {'foo':1}
+      val.y = 'my name is Foo!'
+      shrimp.writeChanges(val)
+    ).then( ->
+      expect(fs.statSync(file).size).toBeGreaterThan(20)
+      fs.unlinkSync(file)
+    ).done(->done())
+    
+  it 'can open existing db files', ->
+    expect(7).toEqual(7)
