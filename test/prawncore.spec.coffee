@@ -70,7 +70,6 @@ checkStdQueries = (queryFactory) ->
     checkStdQuery01(queryFactory())
     checkStdQuery02(queryFactory())
 
-
 rec = (docId, terms) -> {docId:docId, terms: (new Buffer(t) for t in terms)}
 
 describe 'Prawn query system', ->
@@ -129,7 +128,7 @@ makeTempIndex = ->
         return index.create().then(-> index.init()).then(-> index)
     )
 
-describe 'Prawn indexes', ->
+describe 'Prawn index', ->
     index = null
     it 'can be created', ->
         success ->
@@ -138,34 +137,59 @@ describe 'Prawn indexes', ->
                 index = i
             )
             
-    it 'encode terms', ->
+    it 'encodes terms', ->
         terms = prawn.termifyObject('Phil')
         expect(terms.length).toEqual(1)
         len = terms[0].length
         expect(terms[0].slice(len - 4, len).toString()).toEqual('Phil')
         
-    it 'encode objects', ->
+    it 'encodes objects', ->
         terms = prawn.termifyObject({'name':'Phil'})
         expect(terms.length).toEqual(1)
         len = terms[0].length
         expect(terms[0].slice(len - 4, len).toString()).toEqual('Phil')
         
-    it 'encode objects with numbers', ->
+    it 'encodes objects with numbers', ->
         terms = prawn.termifyObject({'magic':42})
         expect(terms.length).toEqual(1)
         len = terms[0].length
         prawn.decodeNumber(terms[0], len - 8)
         expect(terms[0].readDoubleBE(len - 8)).toEqual(42)
 
-    it 'can be written to', ->
+    it 'can write a single object', ->
         success ->
-            updates = [ {t:prawn.termifyObject({'id':1, 'name':'Phil'}), d:-1} ]
-            console.log index, index.applyUpdates, ' PPPP'
+            obj1 = {'id':1, 'name':'Phil'}
+            updates = [ {t:prawn.termifyObject(obj1), o:'i'} ]
             index.applyUpdates(updates)
-            .then(-> console.log 'INDEX1', index)
-            .then(-> console.log 'INDEX2', index)
-        
+            .then(-> index.findTerm 'abc')
+            .then((q) -> prawn.serializeResults q)
+            .then((results) -> expect(results).toEqual([obj1]))
 
+    it 'can write multiple objects', ->
+        success ->
+            obj1 = {'id':1, 'name':'Phil'}
+            obj2 = {'id':2, 'name':'Joe'}
+            updates = [
+                {t:prawn.termifyObject(obj2), o:'i'}
+            ]
+            index.applyUpdates(updates)
+            .then(-> index.findTerm 'abc')
+            .then((q) -> prawn.serializeResults q)
+            .then((results) -> expect(results).toEqual([obj1, obj2]))
+
+# TODO test children lists
+# TODO implement and test prefixes in list headers
+# TODO 
+
+    #it 'is ok', ->
+    #    val = 1
+    #    incrAndReturn1 = () ->
+    #        val += 1
+    #        return 1
+    #    val += incrAndReturn1()
+    #    expect(val).toEqual(3)
+        
+                
   #it 'can make new db files', (done)->
   #  file = 'testdata.prawn'
   #  shrimp = new prawn.ShrimpDb(file)
@@ -178,4 +202,3 @@ describe 'Prawn indexes', ->
   #    expect(fs.statSync(file).size).toBeGreaterThan(20)
   #    fs.unlinkSync(file)
   #  ).done(->done())
-

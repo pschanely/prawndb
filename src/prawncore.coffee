@@ -64,26 +64,12 @@ decodeNumber = (buf, offset) ->
     else
         buf.writeUInt8(headByte ^ 0x80, offset)
 
-decodeAtomic = (buf, offset, len) ->
-    switch buf.readUInt8(offset)
-        when _NULL then null
-        when _FALSE then false
-        when _NUMBER
-            offset += 1
-            decodeNumber(buf, offset)
-            num = buf.readDoubleBE(val, offset)
-            encodeNumber(buf, offset)
-            return num
-        when _STRING
-            return buf.toString('utf8', offset + 1, len - 1)
-        when _TRUE then true
-
 class UserError
 # extends Error
 
 termifyObject = (obj, prefix, terms) ->
     if not prefix
-        prefix = new WritingBuffer(new Buffer(32))
+        prefix = new PositionalBuffer(new Buffer(32))
         terms = []
     if util.isArray(obj)
         for item in obj
@@ -97,6 +83,7 @@ termifyObject = (obj, prefix, terms) ->
             termifyObject(val, curPrefix, terms)
     else
         termBuffer = prefix.copy()
+        termBuffer.writeVint(0)
         termBuffer.encodeAtomic(obj)
         terms.push(termBuffer.done())
     return terms
@@ -122,12 +109,95 @@ readBuffer = (fd, ptr, sz) ->
     if sz == 0
         return Q.fcall(->buf)
     else
-        console.log 'readbuff', fd, buf, 0, sz,  ptr
+        console.log 'readbuff @', ptr
         Q.nfcall(fs.read, fd, buf, 0, sz, ptr).then(-> buf)
 
 setFile = (fd, content) ->
     d = Q.nfcall(fs.write, fd, content, 0, content.length, 0)
     d.then(-> Q.nfcall(fs.fsync, fd))
+
+termsToObject = (terms) ->
+    console.log 'terms to object ', terms
+    obj = {}
+    for term in terms
+        buffer = new PositionalBuffer term
+        objPtr = obj
+        len = buffer.readVint()
+        while true
+            key = buffer.readString(len)
+            len = buffer.readVint()
+            if len == 0
+                objPtr[key] = buffer.decodeAtomic()
+                break
+            val = objPtr[key]
+            if not val?
+                val = objPtr[key] = {}
+            objPtr = val
+    return obj
+
+serializeResults = (query, results) ->
+    if not results?
+        results = []
+    docId = query.doc()
+    if docId == -1
+        throw new Error('cannot serialize an uninitialized query')
+    if docId < Number.MAX_VALUE
+        results.push(termsToObject(query.terms()))
+        Q.when(query.next()).then(-> serializeResults(query, results))
+    else
+        Q.fcall(-> results)
+
+sendResults = (query, response) ->
+    docId = query.doc()
+    if docId < Number.MAX_VALUE
+        response.write(JSON.stringify(termsToObject(query.terms())))
+        Q.when(query.next()).then(-> serializeResults(query, response))
+        query.next()
+    else
+        response.end()
+
+digestSamples = (terms, numBuckets, digest) ->
+    terms = terms.sort()
+    termsPerBucket = terms.length / numBuckets
+    for index in [1 ... numBuckets]
+        digest.push(terms[index * termsPerBucket])
+
+collectTerms = (query, count) ->
+    terms = []
+    while query.next() < Number.MAX_VALUE
+        for term in query.terms()
+            terms.push(term)
+        if terms.length >= sampleSize
+            return terms
+        
+sampleAllTerms = (query, count) ->
+    numLists = Math.floor(Math.sqrt(count) / 5) + 1
+    sqrtOfListLength = Math.floor(Math.sqrt(count / numLists))
+    numSampleTerms = numLists * 10 + 100
+    digests = []
+    for _ in [0...sqrtOfListLength]
+        digestSamples(collectTerms(query, sqrtOfListLength), numLists, digests)
+    results = []
+    digestSamples(digests, numLists, results)
+    return results
+
+balanceItems = (items, targetCountPerTier) ->
+    numTiers = 1
+    while items.length / Math.pow(targetCountPerTier, numTiers) > 1.0
+        numTiers += 1
+    # take the Nth root of the item count, where N is the tree depth
+    actualCountPerTier = Math.pow(items.length, 1 / numTiers)
+    return balanceTier(items, actualCountPerTier)
+
+balanceTier = (items, actualCountPerTier) ->
+    if items.length <= actualCountPerTier
+        return items
+    bucketSize = items.length / actualCountPerTier
+    result = new Array(actualCountPerTier)
+    for bucket in [0 ... actualCountPerTier]
+        subitems = items[bucket * bucketSize : bucket * (bucketSize + 1)]
+        result[bucket] = balanceTier(subitems)
+    return result
 
 class PrawnIndex
     constructor: (options) ->
@@ -164,7 +234,8 @@ class PrawnIndex
     init: ->
         buf = new Buffer(1024)
         Q.nfcall(fs.fstat, @headerFd).then((headerStats) =>
-            pos = headerStats.size - 1024
+            @headerSz = headerStats.size
+            pos = @headerSz - 1024
             Q.nfcall(fs.read, @headerFd, buf, 0, 1024, if pos < 0 then 0 else pos)
         ).then(([numRead, _buffer]) =>
             lines = buf.toString('ascii', 0, numRead).split('\n')
@@ -179,47 +250,39 @@ class PrawnIndex
         # root tree is an ordered list of [ {t[erm]:,p[tr]:,s[ize]:,c[ount]:,[prefi]x:,m[ax_docid]}, ]
         # TODO: if the file is bigger than the header indicates, it should be truncated to the given length
 
-    appendAll:(fd, data) ->
-        this.writeAll(fd, data, 0, @header.ptr + @header.sz)
+    appendAll:(fd, data, position) ->
+        this.writeAllData(fd, data, 0, position)
         
-    writeAll:(fd, data, offset, position) ->
+    writeAllData:(fd, data, offset, position) ->
         remaining = data.length - offset
-        d = Q.defer()
-        fs.write(fd, data, offset, remaining, position, (err, written, _buffer) ->
-            if err
-                d.reject()
-            else if written < remaining
-                d.fulfill(=> this.writeAll(fd, data, offset + written, position + written))
-            else
-                d.fulfill(null)
+        #console.log 'write all fs.write ', data, ' at ', position, '(size=', remaining, ')'
+        promise = Q.nfcall(fs.write, fd, data, offset, remaining, position)
+        return promise.then((written, _buffer) ->
+            if written < remaining
+                return this.writeAllData(fd, data, offset + written, position + written)
         )
-        return d
-        #console.log 'write all fs.write ', data, offset, remaining, position
-        #promise = Q.nfcall(fs.write, fd, data, offset, remaining, position)
-        #return promise.then((written, _buffer) ->
-        #    console.log 'writeAll response: wtn= ', written, ' buf= ', _buffer
-        #    if written < remaining
-        #        return this.writeAll(fd, data, offset + written, position + written)
-        #)
 
     writeRootAndHeader:(dataChunks, newRootTree) ->
         rootBuffer = new Buffer(JSON.stringify(newRootTree))
         dataChunks.push(rootBuffer)
-        newHeader = {
-            'ptr': @header.ptr + @header.sz,
-            'sz': rootBuffer.length
-        }
+        newHeader = _.clone(@header)
+        newHeader.ptr += newHeader.sz
+        newHeader.sz = rootBuffer.length
         headerBuffer = new Buffer(JSON.stringify(newHeader))
-        this.appendAll(@dataFd, dataChunks.join('')).then( =>
-            this.appendAll(@dataFd, headerBuffer)
-        ).then( =>
+        this.appendAll(@dataFd, Buffer.concat(dataChunks), @header.ptr + @header.sz).then(=>
+            this.appendAll(@headerFd, headerBuffer, @headerSz)
+        ).then(=>
             @rootTree = newRootTree
             @header = newHeader
+            @headerSz += headerBuffer.length
         )
     
     findTerm:(term) ->
         rec = @rootTree[_.sortedIndex(@rootTree, {t:term}, (r) -> r.t) - 1]
-        new Stack(@dataFd, readBuffer(@dataFd, rec.p, rec.s))
+        readBuffer(@dataFd, rec.p, rec.s).then((buf) =>
+            query = new Stack(@dataFd, buf)
+            console.log ' about to call NEXT'
+            query.next().then(->query))
 
     applyUpdates:(updates) ->
         # updates is a list of {
@@ -228,18 +291,14 @@ class PrawnIndex
         #     o[peration]: <one of: 'i'[nsert],'r'[emove],'c'[heck]>
         # }
         console.log 'root tree ', @rootTree, ' updates ', updates
-        maxDocId = @header.m
-        newMax = 0
         for update in updates
-            if update.d < 0
-                update.d = maxDocId - update.d
-                if update.d > newMax then newMax = update.d
-                update.o = 'i'
-        if newMax
-            @header.m = newMax
-        
+            if not update.d?
+                if update.o != 'i'
+                    throw new Error('Object without an ID can only be inserted: '+update)
+                @header.m += 1
+                update.d = @header.m
         handled_indexes = new Array(@rootTree.length)
-        rt = (_.clone(rec) for rec in @rootTree) # copy
+        rt = (_.clone(rec) for rec in @rootTree) # copy root tree
         promises = []
         for update in updates
             console.log 'apply consider ', update
@@ -295,19 +354,19 @@ class PrawnIndex
                 count += item.children.count
             console.log 'write items ? ', item.children
         ptr = dataChunks.reduce ((prev, cur) -> prev + cur.length), @header.ptr + @header.sz
-        chunk = new BufferStackFrame(new Buffer(2048)).writeAll(items)
+        chunk = new BufferStackFrame(new Buffer(2048)).writeAllItems(items)
+        console.log 'CHUNK ! ', chunk
         dataChunks.push(chunk)
         return {ptr: ptr, sz: chunk.length, count: count}
 
     spliceUpdates:(updates, items, item_idx) ->
-        console.log 'updates', updates
-        recs = {
+        recs = ({
             docId: update.d,
             terms: update.t,
             count: 1
-        } for update in updates
-        console.log 'splice ', recs, ' into ', items
-        items.splice.apply(items, [item_idx, 0, ].concat(recs))
+        } for update in updates)
+        console.log 'splice ', recs, ' at position: ', item_idx
+        items[item_idx...item_idx] = recs
         
     applyUpdatesToItems:(updates, items) ->
         # when resulting promise is fulfilled, frame items have been updated
@@ -317,10 +376,10 @@ class PrawnIndex
         promises = []
         update_idx = 0
         for item_idx in [0 .. items.length - 1]
-            console.log 'auti', item_idx, ' - ', items.length
             item = items[item_idx]
             curDoc = item.d
             if updates[update_idx].d < curDoc
+                console.log 'applyUpdatesToItems found insertion for=',updates[update_idx],' before=', item 
                 # make subupdates
                 subupdates = [updates[update_idx]]
                 update_idx += 1
@@ -359,42 +418,12 @@ class PrawnIndex
                         item.t = _.uniq(_.sortBy(_.union(item.t, update.t), _.identity), true)
                     when 'r'
                         item.t = _.difference(item.t, update.t)
-                
+        if update_idx < updates.length
+            this.spliceUpdates(updates[update_idx..], items, items.length)
+            return Q.fcall(-> null)
         return if promises then Q.all(promises) else null
                     
  
-class Stack
-    constructor: (@dataFd, @buffer) ->
-        @stack = [] # stack items are BufferStackFrame objects
-        @curFrame = new BufferStackFrame(@buffer)
-        
-    advance:(docId) ->
-        id = @curFrame.advance(docId)
-        if id != Number.MAX_VALUE
-            if @curFrame.hasChildren
-                @stack.push(@curFrame)
-                buf = Buffer(@curFrame.childrenSz)
-
-                promise = Q.nfcall(fs.read, @dataFd, buf, 0,
-                    @curFrame.childrenSz,
-                    @curFrame.childrenPtr)
-                promise.then (err, bytesRead) ->
-                    @curFrame = new BufferStackFrame(buf)
-                    this.advance(docId)
-            else
-                id
-        else if ! @stack
-            Number.MAX_VALUE
-        else
-            @curFrame = @stack.pop()
-            return this.advance(docId)
-            
-    doc:() -> @curFrame.doc()
-    term:() -> @curFrame.term()
-    termCount:() -> @curFrame.termCount()
-    getTerm:(idx) -> @curFrame.getTerm(idx)
-    terms:() -> @curFrame.terms()
-
 readVint = (rec) ->
     num = rec.buffer.readInt32BE(rec.ptr)
     rec.ptr += 4
@@ -444,29 +473,12 @@ class BaseQuery
             a[i] = this.getTerm(i)
         return a
 
-class WrappingQuery
-    constructor: (@query) ->
-    next: -> @query.next()
-    advance: (docId) -> @query.advance(docId)
-    check: (docId) -> @query.check(docId)
-    term: () -> @query.term()
-    terms:() -> @query.terms()
-    doc: () -> @query.doc()
-    termCount: () -> @query.termCount()
-    getTerm: (idx) -> @query.getTerm(idx)
-
-class PromiseOnlyQuery extends WrappingQuery
-    constructor: (@query) ->
-    next: -> Q.when(@query.next())
-    advance: (docId) -> Q.when(@query.advance(docId))
-    check: (docId) -> Q.when(@query.check(docId))
-
-
-class WritingBuffer
-    constructor: (@buffer) ->
-        if not @buffer
+class PositionalBuffer
+    constructor: (@buffer, @ptr) ->
+        if not @buffer?
             @buffer = new Buffer(512)
-        @ptr = 0
+        if not @ptr?
+            @ptr = 0
     ensureRoom:(sz) ->
         if @ptr + sz >= @buffer.length
             newbuf = new Buffer(@buffer.length * 2 + sz)
@@ -480,12 +492,30 @@ class WritingBuffer
     writeString:(other) ->
         # TODO what is the fastest way to calculate this?
         # Buffer.byteLength()? or multiply by 4 for worst case unicode scenario?
-        this.ensureRoom(Buffer.byteLength(other))
-        numWritten = @buffer.write(other)
+        len = Buffer.byteLength(other)
+        this.ensureRoom(len)
+        numWritten = @buffer.write(other, @ptr, len)
         @ptr += numWritten
+    readString:(numBytes) ->
+        start = @ptr
+        @ptr += numBytes
+        return @buffer.toString('utf8', start, @ptr)
+    writeBit:(val) ->
+        this.ensureRoom(1)
+        @buffer.writeUInt8((if val then 1 else 0), @ptr)
+        @ptr += 1
+    readBit: () ->
+        num = @buffer.readUInt8(@ptr)
+        @ptr += 1
+        return num
     writeVint:(val) ->
         this.ensureRoom(8)
         @buffer.writeUInt32BE(val, @ptr)
+        @ptr += 4
+    readVint:() ->
+        num = @buffer.readUInt32BE(@ptr)
+        @ptr += 4
+        return num
     encodeAtomic:(val) ->
         switch typeof val
             when 'null'
@@ -502,17 +532,35 @@ class WritingBuffer
                 @ptr += 8
             when 'string'
                 @buffer.writeUInt8(_STRING, @ptr)
-                @ptr += 1 + @buffer.write(val, @ptr + 1)
+                @ptr += 1
+                @ptr += @buffer.write(val, @ptr)
+    decodeAtomic: ->
+        buf = @buffer
+        ptr = @ptr
+        switch buf.readUInt8(ptr)
+            when _NULL then null
+            when _FALSE then false
+            when _NUMBER
+                ptr += 1
+                decodeNumber(buf, ptr)
+                num = buf.readDoubleBE(ptr)
+                encodeNumber(buf, ptr)
+                return num
+            when _STRING
+                return buf.toString('utf8', ptr + 1)
+            when _TRUE then true
     copy: ->
         result = new Buffer(@buffer.length)
         @buffer.copy(result, 0, 0, @ptr)
-        return new WritingBuffer(result)
+        copy = new PositionalBuffer(result)
+        copy.ptr = @ptr
+        return copy
     done: ->
         result = new Buffer(@ptr)
         @buffer.copy(result, 0, 0, @ptr)
         return result
 
-class BufferStackFrame extends WritingBuffer
+class BufferStackFrame extends PositionalBuffer
     constructor: (buffer) ->
         super(buffer)
         @docId = -1
@@ -522,39 +570,23 @@ class BufferStackFrame extends WritingBuffer
         if @docId == -1
             this.readEntry()
         while @docId < Number.MAX_VALUE
-            items.push({
+            item = {
                 docId: @docId,
                 terms: this.terms(),
-                children: {'ptr':@childrenPtr, 'sz':@childrenSz}
-            })
+                children: undefined
+            }
+            if @hasChildren
+                item['children'] = {'ptr':@childrenPtr, 'sz':@childrenSz}
+            items.push(item)
             this.readEntry()
         return items
-    writeAll: (items) ->
+    writeAllItems: (items) ->
         @ptr = 0
         for item in items
             this.writeEntry(item.docId, item.terms, item.children)
         return @buffer.slice(0, @ptr)
-    writeBit:(val) ->
-        this.ensureRoom(1)
-        @buffer.writeUInt8((if val then 1 else 0), @ptr)
-    readBit: () ->
-        num = @buffer.readUInt8(@ptr)
-        @ptr += 1
-        return num
-    writeVint:(val) ->
-        this.ensureRoom(8)
-        @buffer.writeUInt32BE(val, @ptr)
-    readVint:() ->
-        num = @buffer.readUInt32BE(@ptr)
-        @ptr += 4
-        return num
-    ensureRoom:(sz) ->
-        if @ptr + sz >= @buffer.length
-            newbuf = new Buffer(@buffer.length * 2 + sz)
-            @buffer.copy(newbuf, 0, 0, @buffer.length)
-            @buffer = newbuf
     writeEntry:(docId, terms, childFrame) ->
-        console.log 'writeEntry start @ ', @ptr
+        console.log 'writeEntry start @ ', @ptr, 
         this.writeBit(childFrame)
         this.writeVint(docId - @docId)
         if childFrame
@@ -571,12 +603,11 @@ class BufferStackFrame extends WritingBuffer
         console.log 'writeEntry end @ ', @ptr
     readEntry: () ->
         console.log 'readEntry prev mid @ ', @ptr
-        if @ptr != -1
+        if @ptr != 0
             # skip the term data of current document
-            for i in [0..@termCt]
-                @ptr += this.readVint()
-        else
-            @ptr = 0
+            for i in [0..@termCt - 1]
+                termlen = this.readVint()
+                @ptr += termlen
         if @ptr == @buffer.length
             @docId = Number.MAX_VALUE
             @termCt = 0
@@ -588,15 +619,16 @@ class BufferStackFrame extends WritingBuffer
             @childrenPtr = this.readVint()
             @childrenSz = this.readVint()
         @termCt = this.readVint()
-        console.log 'readEntry new mid @ ', @ptr
+        console.log 'readEntry got id:', @docId, ' termct:', @termCt, ' children:', @childrenPtr
+        console.log 'X', @buffer.slice((if @ptr - 20 < 0 then 0 else @ptr - 20), @ptr)
+        console.log 'readEntry new mid @ ', @ptr, @buffer.slice(@ptr)
     doc: () -> @docId
     advance: (docId) ->
-        if @ptr == -1
-            @ptr = 0
-        else if @ptr == @buffer.length
-            Number.MAX_VALUE
-        else
+        while @docId < docId
+            if @ptr == @buffer.length
+                return Number.MAX_VALUE
             this.readEntry()
+        return @docId
     termCount: () -> @termCt
     getTerm: (i) ->
         originalPtr = @ptr
@@ -614,12 +646,66 @@ class BufferStackFrame extends WritingBuffer
         originalPtr = @ptr
         i = 0
         while i < termCt
-            termlen += this.readVint()
+            termlen = this.readVint()
             buf = new Buffer(termlen)
             @buffer.copy(buf, 0, @ptr, @ptr + termlen)
+            @ptr += termlen
             a[i] = buf
             i += 1
+        @ptr = originalPtr
+        console.log 'Buffer stack frame terms = ', a, @termCt
         return a
+
+class Stack extends BaseQuery
+    constructor: (@dataFd, @buffer) ->
+        @stack = [] # stack items are BufferStackFrame objects
+        console.log 'new stack starting with ', @buffer
+        @curFrame = new BufferStackFrame(@buffer)
+    advance:(docId) ->
+        console.log 'advance ', docId, @curFrame
+        if not @curFrame?
+            return Number.MAX_VALUE
+        Q.when(@curFrame.advance(docId)).then((id) =>
+            console.log 'frame advance = ', id
+            if id != Number.MAX_VALUE
+                if @curFrame.hasChildren
+                    @stack.push(@curFrame)
+                    buf = Buffer(@curFrame.childrenSz)
+                    promise = Q.nfcall(fs.read, @dataFd, buf, 0,
+                        @curFrame.childrenSz,
+                        @curFrame.childrenPtr)
+                    return promise.then((err, bytesRead) ->
+                        @curFrame = new BufferStackFrame(buf)
+                        this.advance(docId)
+                    )
+                else
+                    return id
+            else
+                @curFrame = @stack.pop()
+                return this.advance(docId)
+        )
+    doc:() -> if @curFrame? then @curFrame.doc() else Number.MAX_VALUE
+    term:() -> @curFrame.term()
+    termCount:() -> @curFrame.termCount()
+    getTerm:(idx) -> @curFrame.getTerm(idx)
+    terms:() -> @curFrame.terms()
+
+class WrappingQuery
+    constructor: (@query) ->
+    next: -> @query.next()
+    advance: (docId) -> @query.advance(docId)
+    check: (docId) -> @query.check(docId)
+    term: () -> @query.term()
+    terms:() -> @query.terms()
+    doc: () -> @query.doc()
+    termCount: () -> @query.termCount()
+    getTerm: (idx) -> @query.getTerm(idx)
+
+class PromiseOnlyQuery extends WrappingQuery
+    constructor: (@query) ->
+    next: -> Q.when(@query.next())
+    advance: (docId) -> Q.when(@query.advance(docId))
+    check: (docId) -> Q.when(@query.check(docId))
 
 class LiteralQuery extends BaseQuery
     constructor: (@list) ->
@@ -751,11 +837,6 @@ class FilteredQuery
 class ScoringQuery
     constructor: (@criteria, @rangeEvalfnWeightList) ->
 
-class Bag
-    constructor: () ->
-        @fh = null
-        @docHeads = null
-    executeQuery: (query, options, resp) ->
 
 # At the inner level, we construct query objects (AndQuery etc),
 # and that's how we can dynamically adjust ranges
@@ -773,3 +854,4 @@ exports.PrawnIndex = PrawnIndex
 exports.termifyObject = termifyObject
 exports.encodeNumber = encodeNumber
 exports.decodeNumber = decodeNumber
+exports.serializeResults = serializeResults
